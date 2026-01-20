@@ -46,22 +46,47 @@ jobs:
     #
     # - name: Build with Gradle 8.9
     #   run: gradle build
-
-  dependency-submission:
-
+  build-debug:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-
+      contents: write # 必须有写权限才能创建 Release
     steps:
-    - uses: actions/checkout@v4
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
+      - uses: actions/checkout@v4
+    
+      - name: set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+    
+      # 4. 执行打包并签名
+      - name: Build Debug APK
+        run: ./gradlew assembleDebug
+    
+      # 5. 上传到 GitHub Release
+      - name: Create Debug
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') # 只有推送到 tag 时才触发发布
+        with:
+          files: app/build/outputs/apk/debug/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-    # Generates and submits a dependency graph, enabling Dependabot Alerts for all project dependencies.
-    # See: https://github.com/gradle/actions/blob/main/dependency-submission/README.md
-    - name: Generate and submit dependency graph
-      uses: gradle/actions/dependency-submission@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
+  # dependency-submission:
+
+  #   runs-on: ubuntu-latest
+  #   permissions:
+  #     contents: write
+
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #   - name: Set up JDK 17
+  #     uses: actions/setup-java@v4
+  #     with:
+  #       java-version: '17'
+  #       distribution: 'temurin'
+
+  #   # Generates and submits a dependency graph, enabling Dependabot Alerts for all project dependencies.
+  #   # See: https://github.com/gradle/actions/blob/main/dependency-submission/README.md
+  #   - name: Generate and submit dependency graph
+  #     uses: gradle/actions/dependency-submission@af1da67850ed9a4cedd57bfd976089dd991e2582 # v4.0.0
