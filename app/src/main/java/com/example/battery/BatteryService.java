@@ -4,17 +4,15 @@ import android.accessibilityservice.AccessibilityService;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.Service;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.os.BatteryManager;
-import android.os.Binder;
 import android.os.Handler;
-import android.os.IBinder;
 import android.os.Looper;
 import android.os.Message;
+import android.os.PowerManager;
 import android.util.Log;
 import android.view.accessibility.AccessibilityEvent;
 
@@ -31,6 +29,9 @@ import java.io.InputStreamReader;
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 public  class BatteryService extends AccessibilityService {
 
@@ -38,17 +39,17 @@ public  class BatteryService extends AccessibilityService {
     private static final String NOTIFICATION_CHANNEL_ID = "BatteryMonitorChannel";
     private static final String NOTIFICATION_CHANNEL_NAME = "Battery Monitor";
     private static final int NOTIFICATION_ID = 1;
-    private static final String BATTERY_DATA_FILENAME = "battery_data.json";
-    private static final int SAVE_INTERVAL = 12; // Save every 12 data points (approx. every minute)
+    private static final String FILE_JSON_NAME = "battery_data.json";
+    private static final int COUNT_PER_MINUTE = 12; // Save every 12 data points (approx. every minute)
     private static BatteryService mInstance;
 
     private long mScreenOnCount;
 
 //    private final IBinder mBinder = new LocalBinder();
-    private final List<BatteryData> mBatteryDataPoints = new ArrayList<>();
-    private DataHandler mDataHandler;
+    private final List<BatteryData> mDataList = new ArrayList<>();
+    private RecordHandler mDataHandler;
     private boolean mIsScreenOn = true;
-    long mStartTime;
+    private long mStartTime;
 
     private final BroadcastReceiver mScreenStateReceiver = new BroadcastReceiver() {
         @Override
@@ -67,24 +68,32 @@ public  class BatteryService extends AccessibilityService {
 //        }
 //    }
 
-    private static class DataHandler extends Handler {
-        private final WeakReference<BatteryService> mServiceRef;
-        private static final int MSG_COLLECT_DATA = 1;
+    private final Runnable mRecordTask = () -> {
+        Log.d(TAG, "Record task start");
+        collectBatteryData();
+    };
+    private ScheduledExecutorService mSchedulerService;
+    private PowerManager mPowerManager;
+    private PowerManager.WakeLock mWakeLock;
 
-        DataHandler(BatteryService service, Looper looper) {
+    private static class RecordHandler extends Handler {
+        private final WeakReference<BatteryService> sServiceReference;
+        private static final int MSG_RECORD = 1;
+
+        RecordHandler(BatteryService service, Looper looper) {
             super(looper);
-            mServiceRef = new WeakReference<>(service);
+            sServiceReference = new WeakReference<>(service);
         }
 
         @Override
         public void handleMessage(Message msg) {
-            BatteryService service = mServiceRef.get();
+            BatteryService service = sServiceReference.get();
             if (service == null) {
                 return;
             }
-            if (msg.what == MSG_COLLECT_DATA) {
+            if (msg.what == MSG_RECORD) {
                 service.collectBatteryData();
-                sendEmptyMessageDelayed(MSG_COLLECT_DATA, Constant.REFRESH_RATE_MS);
+                sendEmptyMessageDelayed(MSG_RECORD, Constant.REFRESH_RATE_MS);
             }
         }
     }
@@ -122,9 +131,9 @@ public  class BatteryService extends AccessibilityService {
         super.onCreate();
         Log.d(TAG, "Service created");
         loadDataFromFile();
-        if (!mBatteryDataPoints.isEmpty()) {
-            mStartTime = System.currentTimeMillis() - mBatteryDataPoints.get(mBatteryDataPoints.size() -1).mPastTime;
-            mScreenOnCount = mBatteryDataPoints.get(mBatteryDataPoints.size() -1).mScreenOnCount;
+        if (!mDataList.isEmpty()) {
+            mStartTime = System.currentTimeMillis() - mDataList.get(mDataList.size() -1).mPastTime;
+            mScreenOnCount = mDataList.get(mDataList.size() -1).mScreenOnCount;
         } else {
             mStartTime = System.currentTimeMillis();
         }
@@ -133,7 +142,23 @@ public  class BatteryService extends AccessibilityService {
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
         Log.d(TAG, "Service start");
+        mPowerManager = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        initNotification();
+        initTask();
+        registerScreenStateReceiver();
+        return super.onStartCommand(intent, flags, startId);
+    }
 
+    @Override
+    public void onDestroy() {
+        super.onDestroy();
+        stopTask();
+        unregisterReceiver(mScreenStateReceiver);
+        overwriteData();
+        stopForeground(true);
+    }
+
+    private void initNotification() {
         NotificationChannel channel = new NotificationChannel(NOTIFICATION_CHANNEL_ID, NOTIFICATION_CHANNEL_NAME, NotificationManager.IMPORTANCE_LOW);
         NotificationManager manager = getSystemService(NotificationManager.class);
         manager.createNotificationChannel(channel);
@@ -145,64 +170,83 @@ public  class BatteryService extends AccessibilityService {
                 .build();
 
 //        startForeground(NOTIFICATION_ID, notification);
-
-        mDataHandler = new DataHandler(this, Looper.getMainLooper());
-        startDataCollection();
-        registerScreenStateReceiver();
-        return super.onStartCommand(intent, flags, startId);
     }
 
-    @Override
-    public void onDestroy() {
-        super.onDestroy();
-        stopDataCollection();
-        unregisterReceiver(mScreenStateReceiver);
-        saveDataToFile();
-        stopForeground(true);
+    private void initTask() {
+        mDataHandler = new RecordHandler(this, Looper.getMainLooper());
+        startRecordHandler();
+//        if (mSchedulerService == null) {
+//            try {
+//                mSchedulerService = Executors.newSingleThreadScheduledExecutor();
+//                mSchedulerService.scheduleWithFixedDelay(mRecordTask, 0, Constant.REFRESH_RATE_MS, TimeUnit.MILLISECONDS);
+//            } catch (Exception e) {
+//                Log.e(TAG, "Failed to create scheduler service: " + e.getMessage());
+//                Log.e(TAG, "switch to handler");
+//                mDataHandler = new RecordHandler(this, Looper.getMainLooper());
+//                startRecordHandler();
+//            } finally {
+//                mWakeLock = mPowerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "BatteryMonitor:RecordTask");
+//                mWakeLock.acquire();
+//            }
+//        }
     }
 
-    private void startDataCollection() {
-        mDataHandler.sendEmptyMessage(DataHandler.MSG_COLLECT_DATA);
+    private void stopTask() {
+        if (mSchedulerService != null) {
+            mSchedulerService.shutdown();
+            mSchedulerService = null;
+        }
+        stopRecordHandler();
+        if (mWakeLock != null && mWakeLock.isHeld()) {
+            mWakeLock.release();
+        }
     }
 
-    private void stopDataCollection() {
-        mDataHandler.removeMessages(DataHandler.MSG_COLLECT_DATA);
+    private void startRecordHandler() {
+        if (mDataHandler.hasMessages(RecordHandler.MSG_RECORD)) {
+            mDataHandler.removeMessages(RecordHandler.MSG_RECORD);
+        }
+        mDataHandler.sendEmptyMessage(RecordHandler.MSG_RECORD);
+    }
+
+    private void stopRecordHandler() {
+        if (mDataHandler != null) {
+            mDataHandler.removeCallbacksAndMessages(null);
+        }
     }
 
     private void collectBatteryData() {
         Log.d(TAG, "Collecting battery data");
         IntentFilter filter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        Intent batteryStatus = registerReceiver(null, filter);
+        Intent lastIntent = registerReceiver(null, filter);
         BatteryManager batteryManager = (BatteryManager) getSystemService(Context.BATTERY_SERVICE);
 
-
-        if (batteryStatus != null) {
-            int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, 0);
-            int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, 100);
-            int temperature = batteryStatus.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
-            int voltage = batteryStatus.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0);
-            int status = batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
+        if (lastIntent != null) {
+            int level = lastIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, 0);
+            int temp = lastIntent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
+            int voltage = lastIntent.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0);
+            int status = lastIntent.getIntExtra(BatteryManager.EXTRA_STATUS, -1);
             int current = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_AVERAGE) / 1000;
 
-            synchronized (mBatteryDataPoints) {
+            synchronized (mDataList) {
                 if (mIsScreenOn) {
                     mScreenOnCount++;
                 }
                 Log.d(TAG, "screenOnCount: " + mScreenOnCount);
-                mBatteryDataPoints.add(new BatteryData(System.currentTimeMillis() - mStartTime
-                        , level, scale, temperature, voltage, status, mIsScreenOn, current, mScreenOnCount));
+                mDataList.add(new BatteryData(System.currentTimeMillis() - mStartTime
+                        , level, temp, voltage, status, mIsScreenOn, current, mScreenOnCount));
 
-                if (mBatteryDataPoints.size() % SAVE_INTERVAL == 0) {
-                    saveDataToFile();
+                if (mDataList.size() % COUNT_PER_MINUTE == 0) {
+                    overwriteData();
                 }
             }
         }
     }
 
-    private void saveDataToFile() {
-        synchronized (mBatteryDataPoints) {
+    private void overwriteData() {
+        synchronized (mDataList) {
             JSONArray jsonArray = new JSONArray();
-            for (BatteryData dataPoint : mBatteryDataPoints) {
+            for (BatteryData dataPoint : mDataList) {
                 try {
                     jsonArray.put(dataPoint.toJson());
                 } catch (JSONException e) {
@@ -210,9 +254,9 @@ public  class BatteryService extends AccessibilityService {
                 }
             }
 
-            try (FileOutputStream fos = openFileOutput(BATTERY_DATA_FILENAME, Context.MODE_PRIVATE)) {
+            try (FileOutputStream fos = openFileOutput(FILE_JSON_NAME, Context.MODE_PRIVATE)) {
                 fos.write(jsonArray.toString().getBytes());
-                Log.d(TAG, "Successfully saved " + mBatteryDataPoints.size() + " data points.");
+                Log.d(TAG, "Successfully saved " + mDataList.size() + " data points.");
             } catch (IOException e) {
                 Log.e(TAG, "Error saving data to file", e);
             }
@@ -220,13 +264,13 @@ public  class BatteryService extends AccessibilityService {
     }
 
     private void loadDataFromFile() {
-        File file = new File(getFilesDir(), BATTERY_DATA_FILENAME);
+        File file = new File(getFilesDir(), FILE_JSON_NAME);
         if (!file.exists()) {
             Log.d(TAG, "Data file does not exist. Starting fresh.");
             return;
         }
 
-        try (FileInputStream fis = openFileInput(BATTERY_DATA_FILENAME);
+        try (FileInputStream fis = openFileInput(FILE_JSON_NAME);
              InputStreamReader inputStreamReader = new InputStreamReader(fis);
              BufferedReader bufferedReader = new BufferedReader(inputStreamReader)) {
 
@@ -237,13 +281,13 @@ public  class BatteryService extends AccessibilityService {
             }
 
             JSONArray jsonArray = new JSONArray(stringBuilder.toString());
-            synchronized (mBatteryDataPoints) {
-                mBatteryDataPoints.clear();
+            synchronized (mDataList) {
+                mDataList.clear();
                 for (int i = 0; i < jsonArray.length(); i++) {
                     JSONObject jsonObject = jsonArray.getJSONObject(i);
-                    mBatteryDataPoints.add(new BatteryData(jsonObject));
+                    mDataList.add(new BatteryData(jsonObject));
                 }
-                Log.d(TAG, "Successfully loaded " + mBatteryDataPoints.size() + " data points.");
+                Log.d(TAG, "Successfully loaded " + mDataList.size() + " data points.");
             }
 
         } catch (IOException | JSONException e) {
@@ -251,10 +295,9 @@ public  class BatteryService extends AccessibilityService {
         }
     }
 
-
     public List<BatteryData> getBatteryData() {
-        synchronized (mBatteryDataPoints) {
-            return new ArrayList<>(mBatteryDataPoints);
+        synchronized (mDataList) {
+            return new ArrayList<>(mDataList);
         }
     }
 
@@ -271,18 +314,17 @@ public  class BatteryService extends AccessibilityService {
 
     public void clearData() {
         Log.d(TAG, "clearData: ");
-        synchronized (mBatteryDataPoints) {
+        synchronized (mDataList) {
             mStartTime = System.currentTimeMillis();
             mScreenOnCount = 0;
-            mBatteryDataPoints.clear();
-            saveDataToFile();
+            mDataList.clear();
+            overwriteData();
         }
     }
 
     public static class BatteryData {
         public final long mPastTime;
         public final int mLevel;
-        public final int mScale;
         public final int mTemperature;
         public final int mVoltage;
         public final int mStatus;
@@ -290,10 +332,9 @@ public  class BatteryService extends AccessibilityService {
         public final int mCurrent;
         public final long mScreenOnCount;
 
-        public BatteryData(long timestamp, int level, int scale, int temperature, int voltage, int status, boolean isScreenOn, int current, long screenOnCount) {
+        public BatteryData(long timestamp, int level, int temperature, int voltage, int status, boolean isScreenOn, int current, long screenOnCount) {
             this.mPastTime = timestamp;
             this.mLevel = level;
-            this.mScale = scale;
             this.mTemperature = temperature;
             this.mVoltage = voltage;
             this.mStatus = status;
@@ -306,7 +347,6 @@ public  class BatteryService extends AccessibilityService {
         public BatteryData(JSONObject jsonObject) throws JSONException {
             this.mPastTime = jsonObject.getLong("timestamp");
             this.mLevel = jsonObject.getInt("level");
-            this.mScale = jsonObject.getInt("scale");
             this.mTemperature = jsonObject.getInt("temperature");
             this.mVoltage = jsonObject.getInt("voltage");
             this.mStatus = jsonObject.getInt("status");
@@ -320,7 +360,6 @@ public  class BatteryService extends AccessibilityService {
             JSONObject jsonObject = new JSONObject();
             jsonObject.put("timestamp", mPastTime);
             jsonObject.put("level", mLevel);
-            jsonObject.put("scale", mScale);
             jsonObject.put("temperature", mTemperature);
             jsonObject.put("voltage", mVoltage);
             jsonObject.put("status", mStatus);

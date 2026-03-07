@@ -212,7 +212,7 @@ public class MainActivity extends AppCompatActivity {
 
         for (int i = 0; i < dataPoints.size(); i++) {
             BatteryService.BatteryData dataPoint = dataPoints.get(i);
-            float batteryPct = (dataPoint.mLevel / (float) dataPoint.mScale) * 100;
+            float batteryPct = dataPoint.mLevel;
             Entry newEntry = new Entry((float) dataPoint.mPastTime / 1000, batteryPct);
 
             if (i > 0 && dataPoint.mIsScreenOn != dataPoints.get(i - 1).mIsScreenOn) {
@@ -315,8 +315,8 @@ public class MainActivity extends AppCompatActivity {
 
         mUsageTimeTextView.setText(String.format("%dh %dm", hours, minutes));
 
-        float firstLevel = (firstData.mLevel / (float) firstData.mScale) * 100;
-        float lastLevel = (lastData.mLevel / (float) lastData.mScale) * 100;
+        float firstLevel = firstData.mLevel;
+        float lastLevel = lastData.mLevel;
         float levelDrop = firstLevel - lastLevel;
 
         float current = lastData.mCurrent / 1000.0f; //mA
